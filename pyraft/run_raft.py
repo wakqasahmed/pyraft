@@ -1,6 +1,6 @@
 import os, sys, time
 import threading
-from pyraft import raft
+import raft
 
 node = raft.make_default_node()
 

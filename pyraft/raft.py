@@ -534,141 +534,144 @@ class RaftNode(object):
 
 
 	def do_follower(self):
-		#self.log_info('do_follower')
+		try:
+			self.log_info('do_follower modified')
+			peers = self.select_peer_req(1.0)
+			for p in peers:
+				msg_list = p.raft_wait.read_all()
+				if msg_list == None or msg_list == []:
+					continue
 
-		peers = self.select_peer_req(1.0)
-		for p in peers:
-			msg_list = p.raft_wait.read_all()
-			if msg_list == None or msg_list == []:
-				continue
+				for toks in msg_list:
+					if isinstance(toks, str):
+						toks = toks.split()
 
-			for toks in msg_list:
-				if isinstance(toks, str):
-					toks = toks.split()
+					if toks[0] == 'vote':
+						term = intcast(toks[1].strip())
+						if term == None:
+							self.log_error('invalid vote: %s' % toks)
+							continue
 
-				if toks[0] == 'vote':
-					term = intcast(toks[1].strip())
-					if term == None:
-						self.log_error('invalid vote: %s' % toks)
-						continue
-
-					if term > self.term:
-						p.raft_wait.write('yes')
+						if term > self.term:
+							p.raft_wait.write('yes')
+						else:
+							p.raft_wait.write('no')
 					else:
-						p.raft_wait.write('no')
-				else:
-					old_term = self.term
-					self.handle_request(p, toks)
-					if self.term > old_term:
-						# split brain & new leader elected. 
-						# clean data to install snapshot in case of async mode
-						self.index = 0
-						return
+						old_term = self.term
+						self.handle_request(p, toks)
+						if self.term > old_term:
+							# split brain & new leader elected. 
+							# clean data to install snapshot in case of async mode
+							self.index = 0
+							return
 
-		if self.last_append_entry_ts > 0 and int(time.time()) - self.last_append_entry_ts > CONF_PING_TIMEOUT:
-			self.on_candidate()
-			self.state = 'c'
-
+			if self.last_append_entry_ts > 0 and int(time.time()) - self.last_append_entry_ts > CONF_PING_TIMEOUT:
+				self.on_candidate()
+				self.state = 'c'
+		except Exception as e:
+			self.log_error('Error in do_follower: %s' % str(e))
 
 	def do_candidate(self):
-		if len(self.get_peers()) > 0:
-			connected = 0
-			for nid, p in self.get_peers().items():
-				if p.raft_req.connected():
-					connected += 1
-			if connected == 0:
-				return
+		try:
+			if len(self.get_peers()) > 0:
+				connected = 0
+				for nid, p in self.get_peers().items():
+					if p.raft_req.connected():
+						connected += 1
+				if connected == 0:
+					return
 
-		#self.log_info('do_candidate')
-		self.term += 1
+			self.log_info('do_candidate modified')
+			self.term += 1
 
-		voting_wait = CONF_VOTING_TIME * 0.1
-		vote_wait_timeout = random.randint(0, CONF_VOTING_TIME*1000  * 0.5) / 1000.0
-		wait_remaining = 1 - vote_wait_timeout
-		voted = False
+			voting_wait = CONF_VOTING_TIME * 0.1
+			vote_wait_timeout = random.randint(0, CONF_VOTING_TIME*1000  * 0.5) / 1000.0
+			wait_remaining = 1 - vote_wait_timeout
+			voted = False
 
-		# process vote
-		peers = self.select_peer_req(vote_wait_timeout)
-		for p in peers:
-			msg_list = p.raft_wait.read_all()
-			if msg_list == None or msg_list == []:
-				continue
+			# process vote
+			peers = self.select_peer_req(vote_wait_timeout)
+			for p in peers:
+				msg_list = p.raft_wait.read_all()
+				if msg_list == None or msg_list == []:
+					continue
 
-			for toks in msg_list:
-				if isinstance(toks, str):
-					toks = toks.split()
+				for toks in msg_list:
+					if isinstance(toks, str):
+						toks = toks.split()
 
-				if toks[0] == 'vote':
-					term = intcast(toks[1].strip())
-					if term == None:
-						self.log_error('invalid vote: %s' % toks)
+					if toks[0] == 'vote':
+						term = intcast(toks[1].strip())
+						if term == None:
+							self.log_error('invalid vote: %s' % toks)
+							continue
+
+						if not voted and term >= self.term:
+							p.raft_wait.write('yes')
+							voted = True
+							self.term = term
+						else:
+							if term >= self.term:
+								self.term = term
+								
+							p.raft_wait.write('no')
+					else:
+						if self.handle_request(p, toks):
+							return # elected
+
+			if voted:
+				for nid, p in self.get_peers().items():
+					msg_list = p.raft_wait.read_all(wait_remaining)
+					if msg_list == None or msg_list == []:
 						continue
 
-					if not voted and term >= self.term:
-						p.raft_wait.write('yes')
-						voted = True
-						self.term = term
-					else:
-						if term >= self.term:
-							self.term = term
-							
-						p.raft_wait.write('no')
-				else:
-					if self.handle_request(p, toks):
-						return # elected
+					for toks in msg_list:
+						if isinstance(toks, str):
+							toks = toks.split()
 
-		if voted:
+						if self.handle_request(p, toks):
+							return # elected
+
+				return # not elected try next
+
+			
+			# process vote request
+			count = 1
+			voters = [self.nid]
 			for nid, p in self.get_peers().items():
-				msg_list = p.raft_wait.read_all(wait_remaining)
-				if msg_list == None or msg_list == []:
-					continue
+				p.raft_req.write('vote %d' % self.term)
+			
+			for i in range(2):
+				get_result = {}
+				for nid, p in self.get_peers().items():
+					if nid in get_result:
+						continue
 
-				for toks in msg_list:
-					if isinstance(toks, str):
-						toks = toks.split()
+					msg_list = p.raft_req.read_all(i*(CONF_VOTING_TIME/2))
+					if msg_list == None or msg_list == []:
+						continue
 
-					if self.handle_request(p, toks):
-						return # elected
+					for toks in msg_list:
+						if isinstance(toks, str):
+							toks = toks.split()
 
-			return # not elected try next
+						if toks[0] == 'yes':
+							voters.append(nid)
+							count+=1
+							get_result[nid] = True
+						elif toks[0] == 'no':
+							get_result[nid] = False
+						else:
+							self.handle_request(p, toks)
 
-		
-		# process vote request
-		count = 1
-		voters = [self.nid]
-		for nid, p in self.get_peers().items():
-			p.raft_req.write('vote %d' % self.term)
-		
-		for i in range(2):
-			get_result = {}
-			for nid, p in self.get_peers().items():
-				if nid in get_result:
-					continue
-
-				msg_list = p.raft_req.read_all(i*(CONF_VOTING_TIME/2))
-				if msg_list == None or msg_list == []:
-					continue
-
-				for toks in msg_list:
-					if isinstance(toks, str):
-						toks = toks.split()
-
-					if toks[0] == 'yes':
-						voters.append(nid)
-						count+=1
-						get_result[nid] = True
-					elif toks[0] == 'no':
-						get_result[nid] = False
-					else:
-						self.handle_request(p, toks)
-
-		# process result
-		self.log_info('get %d. voters: %s' % (count, str(voters)))
-		if count > (len(self.peers)+1)/2:
-			self.log_info('%s is a leader' % (self.nid))
-			self.set_leader(self)
-			self.term += 10 
-
+			# process result
+			self.log_info('get %d. voters: %s' % (count, str(voters)))
+			if count > (len(self.peers)+1)/2:
+				self.log_info('%s is a leader' % (self.nid))
+				self.set_leader(self)
+				self.term += 10 
+		except Exception as e:
+			self.log_error('Error in do_candidate: %s' % str(e))
 
 	def append_entry(self, future):
 		ts = time.time()
@@ -720,53 +723,55 @@ class RaftNode(object):
 		return max_diff
 
 	def do_leader(self):
-		#self.log_info('do_leader')
-		for nid, p in self.get_peers().items():
-			self.handle_ack(p)
+		try:		
+			self.log_info('do_leader modified')
+			for nid, p in self.get_peers().items():
+				self.handle_ack(p)
 
-		for nid, p in self.get_peers().items():
-			now = time.time()
-			if p.index == self.index:
-				p.last_delayed_ts = now
-				continue
+			for nid, p in self.get_peers().items():
+				now = time.time()
+				if p.index == self.index:
+					p.last_delayed_ts = now
+					continue
 
-			if now - p.last_delayed_ts > 2.0 and p.raft_req.connected() and p.index < self.index:
-				p.last_delayed_ts = now
-				self.process_install_snapshot(p)
+				if now - p.last_delayed_ts > 2.0 and p.raft_req.connected() and p.index < self.index:
+					p.last_delayed_ts = now
+					self.process_install_snapshot(p)
 
-		try:
-			if self.first_append_entry:
-				self.first_append_entry = False
-				item = self.q_entry.get(False)
-			else:
-				item = self.q_entry.get(True, 1.0)
-		except queue.Empty:
-			item = None
-
-		self.append_entry(item)
-
-		# read peer request if exists
-		peers = self.select_peer_req(0.0)
-		for p in peers:
-			msg_list = p.raft_wait.read_all()
-			if msg_list == None or msg_list == []:
-				continue
-
-			for toks in msg_list:
-				if isinstance(toks, str):
-					toks = toks.split()
-
-				if toks[0] == 'vote':
-					p.raft_wait.write('no')
+			try:
+				if self.first_append_entry:
+					self.first_append_entry = False
+					item = self.q_entry.get(False)
 				else:
-					old_term = self.term
-					self.handle_request(p, toks)
-					if self.term > old_term:
-						# split brain & new leader elected. 
-						# clean data to install snapshot in case of async mode
-						self.index = 0
-						return
+					item = self.q_entry.get(True, 1.0)
+			except queue.Empty:
+				item = None
 
+			self.append_entry(item)
+
+			# read peer request if exists
+			peers = self.select_peer_req(0.0)
+			for p in peers:
+				msg_list = p.raft_wait.read_all()
+				if msg_list == None or msg_list == []:
+					continue
+
+				for toks in msg_list:
+					if isinstance(toks, str):
+						toks = toks.split()
+
+					if toks[0] == 'vote':
+						p.raft_wait.write('no')
+					else:
+						old_term = self.term
+						self.handle_request(p, toks)
+						if self.term > old_term:
+							# split brain & new leader elected. 
+							# clean data to install snapshot in case of async mode
+							self.index = 0
+							return
+		except Exception as e:
+			self.log_error('Error in do_leader: %s' % str(e))
 
 	def get_snapshot(self):
 		meta = {}

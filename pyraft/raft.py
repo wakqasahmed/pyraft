@@ -401,8 +401,10 @@ class RaftNode(object):
 	#
 	def leader_election(self):
 		while True:
+			# establish and maintain connections with other nodes
 			self.raft_connect()
 
+			# Call appropriate methods according to the current state
 			if self.state == 'f':
 				self.do_follower()
 			elif self.state == 'c':
@@ -412,12 +414,15 @@ class RaftNode(object):
 			else:
 				self.log_error('unknown state: %s' % self.state)
 
+			# If shutdown flag is set to True, close communication channels with peers and breaks out of the loop
 			if self.shutdown_flag:
 				for nid, peer in self.get_peers().items():
 					peer.raft_req.close()
 				break
 
 	def set_leader(self, node):
+		# Set the local node as a leader if the provided node parameter matches the current node
+		# Update the local state accordingly
 		if node.nid == self.nid:
 			if self.state != 'l':
 				self.first_append_entry = True
@@ -430,6 +435,7 @@ class RaftNode(object):
 
 			self.state = 'f'
 
+		# Traverse through all the peers and updates their state accordingly
 		for nid, peer in self.get_peers().items():
 			if node.nid == nid:
 				peer.state = 'l'
@@ -546,24 +552,7 @@ class RaftNode(object):
 					if isinstance(toks, str):
 						toks = toks.split()
 
-					if toks[0] == 'vote':
-						term = intcast(toks[1].strip())
-						if term == None:
-							self.log_error('invalid vote: %s' % toks)
-							continue
-
-						if term > self.term:
-							p.raft_wait.write('yes')
-						else:
-							p.raft_wait.write('no')
-					else:
-						old_term = self.term
-						self.handle_request(p, toks)
-						if self.term > old_term:
-							# split brain & new leader elected. 
-							# clean data to install snapshot in case of async mode
-							self.index = 0
-							return
+				self.handle_message(p, toks)
 
 			if self.last_append_entry_ts > 0 and int(time.time()) - self.last_append_entry_ts > CONF_PING_TIMEOUT:
 				self.on_candidate()
@@ -600,24 +589,7 @@ class RaftNode(object):
 					if isinstance(toks, str):
 						toks = toks.split()
 
-					if toks[0] == 'vote':
-						term = intcast(toks[1].strip())
-						if term == None:
-							self.log_error('invalid vote: %s' % toks)
-							continue
-
-						if not voted and term >= self.term:
-							p.raft_wait.write('yes')
-							voted = True
-							self.term = term
-						else:
-							if term >= self.term:
-								self.term = term
-								
-							p.raft_wait.write('no')
-					else:
-						if self.handle_request(p, toks):
-							return # elected
+				self.handle_message(p, toks)
 
 			if voted:
 				for nid, p in self.get_peers().items():
@@ -760,18 +732,44 @@ class RaftNode(object):
 					if isinstance(toks, str):
 						toks = toks.split()
 
-					if toks[0] == 'vote':
-						p.raft_wait.write('no')
-					else:
-						old_term = self.term
-						self.handle_request(p, toks)
-						if self.term > old_term:
-							# split brain & new leader elected. 
-							# clean data to install snapshot in case of async mode
-							self.index = 0
-							return
+				self.handle_message(p, toks)
+
 		except Exception as e:
 			self.log_error('Error in do_leader: %s' % str(e))
+
+	# Refactoring
+	def handle_vote(self, p, term, toks):
+		if term == None:
+			self.log_error('invalid vote: %s' % toks)
+			return False
+
+		if term >= self.term:
+			p.raft_wait.write('yes')
+			self.term = term
+		else:
+			if term >= self.term:
+				self.term = term
+
+			p.raft_wait.write('no')
+
+		return True
+
+	def handle_message(self, p, toks):
+		self.log_info('refactored method handle_message called')
+		if toks[0] == 'vote':
+			term = intcast(toks[1].strip())
+			if self.handle_vote(p, term, toks):
+				return True
+		else:
+			old_term = self.term
+			self.handle_request(p, toks)
+			if self.term > old_term:
+				# split brain & new leader elected.
+				# clean data to install snapshot in case of async mode
+				self.index = 0
+				return True
+
+		return False
 
 	def get_snapshot(self):
 		meta = {}
@@ -1007,5 +1005,3 @@ def make_default_node(): # redis interface node is default now
 		node.load(args.load)
 
 	return node
-
-
